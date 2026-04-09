@@ -1,0 +1,126 @@
+import cv2
+import numpy as np
+import os
+from google.colab.patches import cv2_imshow
+import time
+
+def detect_rottenness_grayscale(gray_image):
+    """
+    Detects rotten regions in a grayscale image using thresholding and morphological operations.
+
+    Args:
+        gray_image (np.array): An 8-bit grayscale NumPy array.
+
+    Returns:
+        np.array: A binary mask (8-bit grayscale) where white pixels (255) represent
+                  detected rotten regions and black pixels (0) represent non-rotten areas.
+    """
+    # 1. Apply a simple thresholding operation to identify dark areas
+    # Use a threshold value of 50 and THRESH_BINARY_INV to get a binary mask
+    # where dark pixels are white (255) and brighter pixels are black (0).
+    _, dark_areas = cv2.threshold(gray_image, 50, 255, cv2.THRESH_BINARY_INV)
+
+    # 2. Create a 5x5 kernel for morphological operations.
+    kernel = np.ones((5, 5), np.uint8)
+
+    # 3. Apply morphological opening to remove small noise.
+    # One iteration is specified as per the instructions.
+    opened_mask = cv2.morphologyEx(dark_areas, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 4. Apply morphological closing to connect nearby dark regions and fill small holes.
+    # Two iterations are specified as per the instructions.
+    closed_mask = cv2.morphologyEx(opened_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    return closed_mask
+
+def process_watershed_opencv(image_file, width=512, height=512):
+    # 1. Load the image using OpenCV
+    if not os.path.exists(image_file):
+        print(f"File {image_file} not found. Skipping.")
+        return
+
+    # --- MODIFIED: Load image data using cv2.imdecode for byte streams ---
+    try:
+        with open(image_file, 'rb') as f:
+            raw_data = f.read()
+        # Use cv2.imdecode to load the image from the byte buffer
+        # IMREAD_GRAYSCALE ensures it's loaded as 8-bit grayscale
+        img = cv2.imdecode(np.frombuffer(raw_data, np.uint8), cv2.IMREAD_GRAYSCALE)
+
+        if img is None:
+            print(f"Could not decode image from {image_file}. Skipping.")
+            return
+
+        # Resize if image dimensions don't match expected (512x512)
+        if img.shape[0] != height or img.shape[1] != width:
+            print(f"Resizing {image_file} from {img.shape} to {height}x{width}")
+            img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
+    except Exception as e:
+        print(f"Could not load raw image {image_file}: {e}. Skipping.")
+        return
+    # ------------------------------------------------
+
+    # 2. Watershed requires a 3-channel image for drawing boundaries
+    img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    # 3. Pre-processing to find markers (Simplified version of CUDA logic)
+    # Thresholding to find sure foreground
+    ret, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Noise removal
+    kernel_ws = np.ones((3,3), np.uint8) # Renamed kernel to avoid conflict with detect_rottenness_grayscale's kernel
+    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_ws, iterations=2)
+
+    # Sure background area
+    sure_bg = cv2.dilate(opening, kernel_ws, iterations=3)
+
+    # Sure foreground area (using Distance Transform)
+    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    ret, sure_fg = cv2.threshold(dist_transform, 0.2 * dist_transform.max(), 255, 0)
+
+    # Finding unknown region
+    sure_fg = np.uint8(sure_fg)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    # 4. Marker labelling
+    ret, markers = cv2.connectedComponents(sure_fg)
+
+    # Add one to all labels so that sure background is not 0, but 1
+    markers = markers + 1
+    # Mark the unknown region with zero
+    markers[unknown == 255] = 0
+
+    # 5. Apply Watershed and measure time
+    print(f"Applying Watershed segmentation to {image_file}...")
+    #start_time = time.time()
+    e1 = cv2.getTickCount()
+    cv2.watershed(img_color, markers)
+    e2 = cv2.getTickCount()
+    #end_time = time.time()
+    elapsed_time = e2 - e1
+    elapsed_time = elapsed_time / cv2.getTickFrequency()
+    print(f"Watershed segmentation completed for {image_file} in {elapsed_time:.4f} seconds.")
+
+    # 6. Create Outputs (Matching your CUDA naming convention)
+    # Segments with boundaries marked in a specific color (e.g., Red)
+    res_boundaries = img_color.copy()
+    res_boundaries[markers == -1] = [0, 0, 255] # Mark watershed boundaries in red (BGR)
+
+    # ----- NEW: Rottenness Detection and Highlighting -----+
+    print(f"Detecting rottenness in {image_file}...")
+    rotten_mask = detect_rottenness_grayscale(img)
+
+    # Highlight rotten regions in yellow (BGR: Blue, Green, Red)
+    res_boundaries[rotten_mask == 255] = [0, 255, 255] # Mark rotten areas in yellow
+    # ---------------------------------------------------
+
+    print(f"Processed: {image_file}")
+    cv2_imshow(res_boundaries)
+
+# List of files to process
+# Correcting the file paths to point to the /content/ directory
+files = ["/content/apple.raw", "/content/carrot.raw", "/content/grape.raw"]
+
+for f in files:
+    process_watershed_opencv(f)
